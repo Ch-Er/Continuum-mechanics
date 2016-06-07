@@ -1,0 +1,163 @@
+#FEM solver. Solves 2D beam (linear elastic material) bending in GUI Octave. Requires Paraview (.vtk).
+
+clear all;
+close all;
+pkg load msh geometry bim fpl 
+
+##########Functions
+function [area,b,c] = HatGradients(x,y)
+area=polyarea(x,y);
+b=[y(2)-y(3); y(3)-y(1); y(1)-y(2)]/2/area;
+c=[x(3)-x(2); x(1)-x(3); x(2)-x(1)]/2/area;
+
+function [mu] = Factor(E,nu)
+mu=E/(1-nu^2);
+
+function Ke = ElasticStiffness(x,y,mu,nu)
+
+#Triangle area and gradients (b,c) of form functions
+[area,b,c]=HatGradients(x,y);
+
+#Elastic matrix
+C=mu*[1 nu 0; nu 1 0; 0 0 (1-nu)/2];
+
+#Strain matrix
+Be=[b(1) 0 b(2) 0 b(3) 0;
+	  0 c(1) 0 c(2)	0	c(3);
+	  c(1) b(1) c(2) b(2)	c(3) b(3)];
+
+#element stiffness matrix
+Ke=Be'*C*Be*area;
+
+function f = Force(x,Q)
+for i = 1:3
+if (x(i) == 1)
+	f=Q*[0*x; x];
+ else
+	f=Q*[0*x; 0*x];
+	end
+ end
+end
+
+function MK = ElasticMass(x,y)
+area=polyarea(x,y);
+MK=[2 0 1 0 1 0;
+0 2 0 1 0 1;
+1 0 2 0 1 0;
+0 1 0 2 0 1;
+1 0 1 0 2 0;
+0 1 0 1 0 2]*area/12;
+
+function [K, M, F] = ElasticAssembler(p, e, t, mu, nu, Q, @Force)
+
+ndof=2*size(p,2); 
+K=sparse(ndof,ndof); 
+M=sparse(ndof,ndof); 
+F=zeros(ndof,1);
+dofs=zeros(6,1); 
+
+#Loop over triangles and determine local K,M,F
+for i=1:size(t,2) 															
+		nodes=t(1:3,i);													 	  
+		x=p(1,nodes); y=p(2,nodes); 								
+		dofs(2:2:end)=2*nodes; 											
+		dofs(1:2:end)=2*nodes-1;
+		f=Force(x,Q); 
+		fK=[f(1,1) f(2,1) f(1,2) f(2,2) f(1,3) f(2,3)]';
+		
+		Ke=ElasticStiffness(x,y,mu,nu); 			
+		MK=ElasticMass(x,y);
+		
+		FK=MK*fK; 
+		M(dofs,dofs)=M(dofs,dofs)+MK; 
+		F(dofs)=F(dofs)+FK;
+		K(dofs,dofs)=K(dofs,dofs)+Ke;						
+end
+#########End functions
+
+mesh_resolution = 0.005;
+
+#Generate mesh (GMSH)
+ rectangle = [tmpnam ".geo"];
+ fid = fopen (rectangle, "w");
+ fputs (fid, "Point(1) = {0, 0,   0,0.005};\n");
+ fputs (fid, "Point(2) = {0, 0.1, 0,0.005};\n");
+ fputs (fid, "Point(3) = {1, 0.1, 0,0.005};\n");
+ fputs (fid, "Point(4) = {1, 0,   0,0.005};\n");
+ fputs (fid, "Line(1) =  {1, 2};\n");
+ fputs (fid, "Line(2) =  {2, 3};\n");
+ fputs (fid, "Line(3) =  {3, 4};\n");
+ fputs (fid, "Line(4) =  {4, 1};\n");
+ fputs (fid, "Line Loop(8) = {1, 2, 3, 4};\n");
+ fputs (fid, "Plane Surface(9) = {8};\n");
+ fclose (fid);
+
+[mesh] = msh2m_gmsh (canonicalize_file_name (rectangle)(1:end-4),"scale",1,"clscale",1);
+[mesh] = bim2c_mesh_properties (mesh);
+
+#Mesh matrix points, edges and connectivity 
+p = mesh.p;
+e = mesh.e;
+t = mesh.t;
+
+#Read fix_boundary (GMSH resolution dependent)
+if (mesh_resolution == 0.001)
+ 	FIX = 101;
+ end
+if (mesh_resolution == 0.002)
+ 	FIX = 51;
+ end
+if (mesh_resolution == 0.003)
+  FIX = 34;
+  end
+if (mesh_resolution == 0.004)
+ 	FIX = 27;
+ end
+if (mesh_resolution == 0.005)
+ 	FIX = 21;
+ end
+if (mesh_resolution == 0.01)
+ 	FIX = 11;
+ end
+
+#Force [N]
+Q = -1e3;
+
+#Material parameters
+E  = 200e9; 
+nu = 0.3;
+
+#Factor 
+[mu] = Factor(E,nu);
+
+tic;
+#Assemble Stiffness matrix K, Mass matrix M and Force vector F 
+[K, M, F] = ElasticAssembler(p,e,t,mu,nu,Q, @Force);
+toc
+
+#Dirichlet boundary_condition
+fixedBoundary = unique([e(1,1:FIX) e(2,1:FIX)]); 
+fixed = [2*fixedBoundary-1 2*fixedBoundary]; #DOF
+
+#Free boundaries
+dof = 2*size(p,2);
+free = setdiff([1:dof],[fixed]);
+
+#Generate zero_vector and correct Force vector
+zero_vector = zeros(length(fixed),1);
+F= F(free)-K(free,fixed)*zero_vector;
+
+#Correct Stiffness matrix
+K = K(free,free);
+
+#Compute solution
+displacement = zeros(dof,1);
+displacement(free) = K\F;
+displacement(fixed) = zero_vector;
+
+U = displacement(1:2:end); 
+V = displacement(2:2:end);
+
+#Send to .vtk
+fpl_vtk_write_field ("u_x", mesh, {U, "u_x"}, {}, 1);
+fpl_vtk_write_field ("u_y", mesh, {V, "u_y"}, {}, 1);
